@@ -84,6 +84,27 @@ __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	return;
 }
 
+
+// ======== MEMORY =========
+
+SEC("kretprobe/si_meminfo")
+
+int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
+	OOMP_LOG("ram used: %d\n", ram_used);
+	u64 total_ram;
+	u64 free_ram;
+	u64 mem_unit;
+
+	bpf_probe_read_kernel(&total_ram, sizeof(total_ram), &info->totalram);
+	bpf_probe_read_kernel(&free_ram, sizeof(free_ram), &info->freeram);
+	bpf_probe_read_kernel(&mem_unit, sizeof(mem_unit), &info->mem_unit);
+
+	ram_used = (total_ram - free_ram) * mem_unit;
+	return 0;
+}
+
+// ======== WRITES =========
+
 __always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
 	u32          pid = bpf_get_current_pid_tgid() >> 32;
 	ProcessInfo *process_stats, init_val = { 0 };
@@ -107,31 +128,38 @@ __always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
 	return 0;
 }
 
-// ======== HOOKS =========
-
-SEC("kretprobe/si_meminfo")
-
-int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
-	OOMP_LOG("ram used: %d\n", ram_used);
-	u64 total_ram;
-	u64 free_ram;
-	u64 mem_unit;
-
-	bpf_probe_read_kernel(&total_ram, sizeof(total_ram), &info->totalram);
-	bpf_probe_read_kernel(&free_ram, sizeof(free_ram), &info->freeram);
-	bpf_probe_read_kernel(&mem_unit, sizeof(mem_unit), &info->mem_unit);
-
-	ram_used = (total_ram - free_ram) * mem_unit;
-	return 0;
-}
-
 SEC("tracepoint/syscalls/sys_enter_write")
 
-int handleWrite(struct trace_event_raw_sys_enter* ctx) {
-	return doHandleWrite(ctx);
-}
+int handleWrite(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite(ctx); }
 
 SEC("tracepoint/syscalls/sys_enter_pwrite64")
-int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { 
-	return doHandleWrite(ctx);
+
+int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite(ctx); }
+
+
+// ======== READS =========
+SEC("tracepoint/syscalls/sys_enter_read")
+int handleRead(struct trace_event_raw_sys_enter *ctx) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    size_t read_size = ctx->args[2]; 
+	
+	ProcessInfo *process_stats, init_val = { 0 };
+
+	OOMP_LOG("Read detected for PID %d", pid);
+
+	process_stats = bpf_map_lookup_elem(&process_map, &pid);
+	if (!process_stats) {
+		OOMP_LOG("No element in map");
+		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
+		process_stats = bpf_map_lookup_elem(&process_map, &pid);
+	}
+
+	if (process_stats) {
+		OOMP_LOG("Element found in map");
+		process_stats->rand_count += read_size;
+		OOMP_LOG("Total read size: %d", process_stats->write_count);
+
+		checkPolicyAndKill(pid, process_stats);
+	}
+	return 0;
 }
