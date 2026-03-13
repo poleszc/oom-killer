@@ -6,6 +6,11 @@
 #include <bpf/bpf_tracing.h>
 
 
+#define OOMP_LOG(fmt, ...)                            \
+	do {                                              \
+		if (isOomp()) bpf_printk(fmt, ##__VA_ARGS__); \
+	} while (0)
+
 char LICENSE[] SEC("license") = "GPL";
 
 #define WRITE_COUNT_UPPER_BOUND      100
@@ -61,11 +66,11 @@ inline bool isOomp() {
 }
 
 // ======== HELPERS =========
-inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
-	if (ram_used < (1024ULL * 1024 * 1024)) return;
+__always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
+	// if (ram_used < (1024ULL * 1024 * 1024)) return;
 	if (!isOomp()) return;
 
-	bpf_printk("Check policy and kill");
+	OOMP_LOG("Check policy and kill");
 
 	bool kill = false;
 	if (stats->write_count >= WRITE_COUNT_UPPER_BOUND) kill = true;
@@ -79,13 +84,35 @@ inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	return;
 }
 
+__always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
+	u32          pid = bpf_get_current_pid_tgid() >> 32;
+	ProcessInfo *process_stats, init_val = { 0 };
+
+	OOMP_LOG("Write detected for PID %d", pid);
+
+	process_stats = bpf_map_lookup_elem(&process_map, &pid);
+	if (!process_stats) {
+		OOMP_LOG("No element in map");
+		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
+		process_stats = bpf_map_lookup_elem(&process_map, &pid);
+	}
+
+	if (process_stats) {
+		OOMP_LOG("Element found in map");
+		process_stats->write_count++;
+		OOMP_LOG("Write count: %d", process_stats->write_count);
+
+		checkPolicyAndKill(pid, process_stats);
+	}
+	return 0;
+}
 
 // ======== HOOKS =========
 
 SEC("kretprobe/si_meminfo")
 
 int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
-	// bpf_printk("SI_MEMINFO");
+	OOMP_LOG("ram used: %d\n", ram_used);
 	u64 total_ram;
 	u64 free_ram;
 	u64 mem_unit;
@@ -94,27 +121,17 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 	bpf_probe_read_kernel(&free_ram, sizeof(free_ram), &info->freeram);
 	bpf_probe_read_kernel(&mem_unit, sizeof(mem_unit), &info->mem_unit);
 
-	total_ram = (total_ram - free_ram) * mem_unit;
+	ram_used = (total_ram - free_ram) * mem_unit;
 	return 0;
 }
 
 SEC("tracepoint/syscalls/sys_enter_write")
 
 int handleWrite(struct trace_event_raw_sys_enter* ctx) {
-	u32          pid = bpf_get_current_pid_tgid() >> 32;
-	ProcessInfo *process_stats, init_val = { 0 };
+	return doHandleWrite(ctx);
+}
 
-	if (isOomp()) bpf_printk("Write detected for PID %d", pid);
-
-	process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	if (!process_stats) {
-		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
-		process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	}
-
-	if (process_stats) {
-		process_stats->write_count++;
-		checkPolicyAndKill(pid, process_stats);
-	}
-	return 0;
+SEC("tracepoint/syscalls/sys_enter_pwrite64")
+int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { 
+	return doHandleWrite(ctx);
 }
