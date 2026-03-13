@@ -150,7 +150,7 @@ InsertNewlineAtEOF: true
 IntegerLiteralSeparator:
   Binary:          8
   BinaryMinDigits: 0
-  Decimal:         3
+  Decimal:         10
   DecimalMinDigits: 0
   Hex:             2
   HexMinDigits:    0
