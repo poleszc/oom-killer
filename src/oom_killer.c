@@ -18,7 +18,6 @@ int main() {
 
 	printf("OMM Killer running\n");
 	for (;;) {
-		printf("Ping\n");
 		struct sysinfo sys_info;
 		sysinfo(&sys_info);
 

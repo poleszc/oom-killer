@@ -105,26 +105,35 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 
 // ======== WRITES =========
 
+static __always_inline __u32 getCurrentProcessPid() { return bpf_get_current_pid_tgid() >> 32; }
+
+// Macro cause verifier gets confused when it's a function
+#define GET_PROCESS_STATS(PID)                                       \
+	ProcessInfo *process_stats, init_val = { 0 };                    \
+	process_stats = bpf_map_lookup_elem(&process_map, &PID);         \
+	if (!process_stats) {                                            \
+		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY); \
+		process_stats = bpf_map_lookup_elem(&process_map, &PID);     \
+	}                                                                \
+	if (!process_stats) return 0
+
+// static __always_inline ProcessInfo* getProcessStatistics(__u32 pid) {
+// 	ProcessInfo *process_stats, init_val = { 0 };
+// 	process_stats = bpf_map_lookup_elem(&process_map, &pid);
+// 	if (!process_stats) {
+// 		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
+// 		process_stats = bpf_map_lookup_elem(&process_map, &pid);
+// 	}
+// 	if (!process_stats) return 0;
+// 	return process_stats;
+// }
+
 __always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
-	u32          pid = bpf_get_current_pid_tgid() >> 32;
-	ProcessInfo *process_stats, init_val = { 0 };
+	u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
 
-	OOMP_LOG("Write detected for PID %d", pid);
-
-	process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	if (!process_stats) {
-		OOMP_LOG("No element in map");
-		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
-		process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	}
-
-	if (process_stats) {
-		OOMP_LOG("Element found in map");
-		process_stats->write_count++;
-		OOMP_LOG("Write count: %d", process_stats->write_count);
-
-		checkPolicyAndKill(pid, process_stats);
-	}
+	process_stats->write_count++;
+	checkPolicyAndKill(pid, process_stats);
 	return 0;
 }
 
@@ -138,28 +147,64 @@ int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite
 
 
 // ======== READS =========
+// TODO: readV?
 SEC("tracepoint/syscalls/sys_enter_read")
-int handleRead(struct trace_event_raw_sys_enter *ctx) {
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    size_t read_size = ctx->args[2]; 
-	
-	ProcessInfo *process_stats, init_val = { 0 };
 
-	OOMP_LOG("Read detected for PID %d", pid);
-
-	process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	if (!process_stats) {
-		OOMP_LOG("No element in map");
-		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY);
-		process_stats = bpf_map_lookup_elem(&process_map, &pid);
-	}
-
-	if (process_stats) {
-		OOMP_LOG("Element found in map");
-		process_stats->rand_count += read_size;
-		OOMP_LOG("Total read size: %d", process_stats->write_count);
-
-		checkPolicyAndKill(pid, process_stats);
-	}
+int handleRead(struct trace_event_raw_sys_enter* ctx) {
+	__u32  pid       = getCurrentProcessPid();
+	size_t read_size = ctx->args[2];
+	GET_PROCESS_STATS(pid);
+	process_stats->read_bytes += read_size;
+	checkPolicyAndKill(pid, process_stats);
 	return 0;
 }
+
+// ======== FILE DESCRIPTORS =========
+
+static __always_inline int doHandleOpenExit(struct trace_event_raw_sys_exit* ctx) {
+	// Don't count the FD if an error occurred.
+	if (ctx->ret <= 0) return 0;
+	__u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
+
+	process_stats->open_fds++;
+	checkPolicyAndKill(pid, process_stats);
+	return 0;
+}
+
+
+SEC("tracepoint/syscalls/sys_exit_openat")
+int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
+
+SEC("tracepoint/syscalls/sys_exit_socket")
+int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
+
+SEC("tracepoint/syscalls/sys_enter_close")
+int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
+	__u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
+
+	if (process_stats->open_fds > 0) process_stats->open_fds--;
+	return 0;
+}
+
+static __always_inline int doHandleCloneExit(struct trace_event_raw_sys_exit* ctx) {
+	// Don't count if the syscall failed or we're a child process.
+	if (ctx->ret <= 0) return 0;
+
+	__u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
+
+	process_stats->thread_count++;
+	checkPolicyAndKill(pid, process_stats);
+	return 0;
+}
+
+
+SEC("tracepoint/syscalls/sys_exit_clone")
+
+int handleCloneExit(struct trace_event_raw_sys_exit* ctx) { return doHandleCloneExit(ctx); }
+
+SEC("tracepoint/syscalls/sys_exit_clone3")
+
+int handleClone3Exit(struct trace_event_raw_sys_exit* ctx) { return doHandleCloneExit(ctx); }
