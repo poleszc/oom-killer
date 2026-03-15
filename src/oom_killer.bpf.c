@@ -7,9 +7,9 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define OOMP_LOG(fmt, ...)                            \
-	do {                                              \
-		if (isOomp()) bpf_printk(fmt, ##__VA_ARGS__); \
+#define OOMP_LOG(fmt, ...)                                   \
+	do {                                                     \
+		if (isOompProcess()) bpf_printk(fmt, ##__VA_ARGS__); \
 	} while (0)
 
 
@@ -25,9 +25,9 @@ char LICENSE[] SEC("license") = "GPL";
  * @brief The overall state for one process.
  */
 typedef struct ProcessInfo {
-	// Count of open file descriptors.
+	// Number of open file descriptors.
 	u64 open_fds;
-	// Count of file writes.
+	// Number of file writes.
 	u64 write_count;
 	// Number of read bytes.
 	u64 read_bytes;
@@ -44,7 +44,7 @@ typedef struct ProcessInfo {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 512 * 2);
+	__uint(max_entries, 16384);
 	__type(key, u32);
 	__type(value, ProcessInfo);
 } process_map SEC(".maps");
@@ -55,7 +55,7 @@ static __u64 ram_used = 0;
 /**
  * @brief Whether a process has a `oomp` substring in its name.
  */
-static __always_inline bool isOomp() {
+static __always_inline bool isOompProcess() {
 	char comm[16] = {};
 	bpf_get_current_comm(&comm, sizeof(comm));
 
@@ -65,12 +65,29 @@ static __always_inline bool isOomp() {
 	return false;
 }
 
+/**
+ * @brief Get the PID of the current process.
+ */
+static __always_inline u32 getCurrentProcessPid() { return bpf_get_current_pid_tgid() >> 32; }
+
+/**
+ * @brief Get the statistics of the specified process or insert new statistics of the process didn't
+ * exist in the map yet.
+ */
+static __always_inline ProcessInfo* getOrCreateProcessStats(u32 pid) {
+	ProcessInfo* stats = bpf_map_lookup_elem(&process_map, &pid);
+	if (!stats) {
+		ProcessInfo init = { 0 };
+		bpf_map_update_elem(&process_map, &pid, &init, BPF_NOEXIST);
+		stats = bpf_map_lookup_elem(&process_map, &pid);
+	}
+	return stats;
+}
+
 // ======== HELPERS =========
 __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	// if (ram_used < (1024ULL * 1024 * 1024)) return;
-	if (!isOomp()) return;
-
-	// OOMP_LOG("Check policy and kill");
+	if (!isOompProcess()) return;
 
 	bool kill = false;
 	if (stats->write_count >= WRITE_COUNT_UPPER_BOUND) kill = true;
@@ -83,6 +100,16 @@ __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	if (kill) bpf_send_signal(9);
 	return;
 }
+
+#define UPDATE_STATS(FIELD, AMOUNT)                        \
+	do {                                                   \
+		if (!isOompProcess()) return 0;                    \
+		u32          pid   = getCurrentProcessPid();       \
+		ProcessInfo* stats = getOrCreateProcessStats(pid); \
+		if (!stats) return 0;                              \
+		__sync_fetch_and_add(&stats->FIELD, AMOUNT);       \
+		checkPolicyAndKill(pid, stats);                    \
+	} while (0)
 
 // ======== MEMORY =========
 
@@ -101,143 +128,89 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 	return 0;
 }
 
-// ======== WRITES =========
-
-static __always_inline u32 getCurrentProcessPid() { return bpf_get_current_pid_tgid() >> 32; }
-
-// Macro cause verifier gets confused when it's a function
-#define GET_PROCESS_STATS(PID)                                       \
-	ProcessInfo *process_stats, init_val = { 0 };                    \
-	process_stats = bpf_map_lookup_elem(&process_map, &PID);         \
-	if (!process_stats) {                                            \
-		bpf_map_update_elem(&process_map, &pid, &init_val, BPF_ANY); \
-		process_stats = bpf_map_lookup_elem(&process_map, &PID);     \
-	}                                                                \
-	if (!process_stats) return 0
-
-static __always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
-	if (!isOomp()) return 0;
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
-
-	process_stats->write_count++;
-	checkPolicyAndKill(pid, process_stats);
+// ======================= WRITES =======================
+SEC("tracepoint/syscalls/sys_enter_write")
+int handleWrite(struct trace_event_raw_sys_enter* ctx) {
+	UPDATE_STATS(write_count, 1);
 	return 0;
 }
-
-SEC("tracepoint/syscalls/sys_enter_write")
-int handleWrite(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite(ctx); }
 
 SEC("tracepoint/syscalls/sys_enter_pwrite64")
-int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite(ctx); }
+int handlePWrite64(struct trace_event_raw_sys_enter* ctx) {
+	UPDATE_STATS(write_count, 1);
+	return 0;
+}
 
-// ======== READS =========
+// ======================= READS =======================
 // TODO: readV?
+// TODO: Trace the exit?
 SEC("tracepoint/syscalls/sys_enter_read")
 int handleRead(struct trace_event_raw_sys_enter* ctx) {
-	if (!isOomp()) return 0;
-	u32    pid       = getCurrentProcessPid();
-	size_t read_size = ctx->args[2];
-	GET_PROCESS_STATS(pid);
-	process_stats->read_bytes += read_size;
-	checkPolicyAndKill(pid, process_stats);
+	UPDATE_STATS(read_bytes, ctx->args[2]);
 	return 0;
 }
 
-// ======== FILE DESCRIPTORS =========
-
-static __always_inline int doHandleOpenExit(struct trace_event_raw_sys_exit* ctx) {
-	if (!isOomp()) return 0;
-	// Don't count the FD if an error occurred.
-	if (ctx->ret <= 0) return 0;
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
-
-	process_stats->open_fds++;
-	checkPolicyAndKill(pid, process_stats);
-	return 0;
-}
-
+// ======================= FILE DESCRIPTORS =======================
 SEC("tracepoint/syscalls/sys_exit_openat")
-int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
+int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0)  // TODOP: Comment
+		UPDATE_STATS(open_fds, 1);
+	return 0;
+}
 
 SEC("tracepoint/syscalls/sys_exit_socket")
-int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
+int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0)  // TODOP: Comment
+		UPDATE_STATS(open_fds, 1);
+	return 0;
+}
 
 SEC("tracepoint/syscalls/sys_enter_close")
 int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
-	if (!isOomp()) return 0;
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
+	if (!isOompProcess()) return 0;
+	u32          pid           = getCurrentProcessPid();
+	ProcessInfo* process_stats = getOrCreateProcessStats(pid);
 
-	if (process_stats->open_fds > 0) process_stats->open_fds--;
+	if (process_stats->open_fds > 0) __sync_fetch_and_sub(&process_stats->open_fds, 1);
 	return 0;
 }
 
-static __always_inline int doHandleCloneExit(struct trace_event_raw_sys_exit* ctx) {
-	if (!isOomp()) return 0;
-	// Don't count if the syscall failed or we're a child process.
-	if (ctx->ret <= 0) return 0;
-
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
-
-	process_stats->thread_count++;
-	checkPolicyAndKill(pid, process_stats);
-	return 0;
-}
-
+// ======================= THREADS =======================
 SEC("tracepoint/syscalls/sys_exit_clone")
-int handleCloneExit(struct trace_event_raw_sys_exit* ctx) { return doHandleCloneExit(ctx); }
+int handleCloneExit(struct trace_event_raw_sys_exit* ctx) {
+	// Don't count if the syscall failed or we're a child process.
+	if (ctx->ret > 0) UPDATE_STATS(thread_count, 1);
+	return 0;
+}
 
 SEC("tracepoint/syscalls/sys_exit_clone3")
-int handleClone3Exit(struct trace_event_raw_sys_exit* ctx) { return doHandleCloneExit(ctx); }
-
-// ======== TCP =========
-SEC("tracepoint/syscalls/sys_enter_sendto")
-int handleSendToEnter(struct trace_event_raw_sys_enter* ctx) {
-	if (!isOomp()) return 0;
-	u32 pid = getCurrentProcessPid();
-
-
-	void*  buf = (void*) ctx->args[1];
-	size_t len = ctx->args[2];
-
-	// To short for an IP header.
-	if (len < 20) return 0;
-
-	u8 protocol = 0;
-	if (bpf_probe_read_user(&protocol, sizeof(protocol), buf + 9) != 0) return 0;
-
-	if (protocol == 6) {
-		GET_PROCESS_STATS(pid);
-
-		process_stats->tcp_packet_count++;
-		checkPolicyAndKill(pid, process_stats);
-	}
+int handleClone3Exit(struct trace_event_raw_sys_exit* ctx) {
+	// Don't count if the syscall failed or we're a child process.
+	if (ctx->ret > 0) UPDATE_STATS(thread_count, 1);
 	return 0;
 }
 
+// ======================= TCP =======================
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int handleSendToEnter(struct trace_event_raw_sys_enter* ctx) {
+	void* buf      = (void*) ctx->args[1];
+	u8    protocol = 0;
+	if (bpf_probe_read_user(&protocol, sizeof(protocol), buf + 9) == 0 && protocol == 6)
+		UPDATE_STATS(tcp_packet_count, 1);
+	return 0;
+}
+
+// ======================= RAND =======================
+// https://github.com/cloudflare/ebpf_exporter/blob/master/examples/uprobe.bpf.c
 // ldd /bin/ls | grep libc
 SEC("uprobe/libc.so.6:rand")
 int handleRand(struct pt_regs* ctx) {
-	if (!isOomp()) return 0;
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
-
-	process_stats->rand_count++;
-	checkPolicyAndKill(pid, process_stats);
+	UPDATE_STATS(rand_count, 1);
 	return 0;
 }
 
-// https://github.com/cloudflare/ebpf_exporter/blob/master/examples/uprobe.bpf.c
 SEC("uprobe/libc.so.6:random")
 int handleRandom(struct pt_regs* ctx) {
-	if (!isOomp()) return 0;
-	u32 pid = getCurrentProcessPid();
-	GET_PROCESS_STATS(pid);
-
-	process_stats->rand_count++;
-	checkPolicyAndKill(pid, process_stats);
+	UPDATE_STATS(rand_count, 1);
 	return 0;
 }
