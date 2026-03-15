@@ -6,10 +6,10 @@
 #include <bpf/bpf_tracing.h>
 
 
-#define OOMP_LOG(fmt, ...)                            \
-	do {                                              \
-		if (isOomp()) bpf_printk(fmt, ##__VA_ARGS__); \
-	} while (0)
+// if (isOomp()) bpf_printk(fmt, ##__VA_ARGS__); \
+
+#define OOMP_LOG(fmt, ...) \
+	do { bpf_printk(fmt, ##__VA_ARGS__); } while (0)
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -55,8 +55,8 @@ static __u64 ram_used = 0;
 /**
  * @brief Whether a process has a `oomp` substring in its name.
  */
-inline bool isOomp() {
-	char comm[16];
+static __always_inline bool isOomp() {
+	char comm[16] = {};
 	bpf_get_current_comm(&comm, sizeof(comm));
 
 	for (int i = 0; i <= 16 - 4; i++)
@@ -70,7 +70,7 @@ __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	// if (ram_used < (1024ULL * 1024 * 1024)) return;
 	if (!isOomp()) return;
 
-	OOMP_LOG("Check policy and kill");
+	// OOMP_LOG("Check policy and kill");
 
 	bool kill = false;
 	if (stats->write_count >= WRITE_COUNT_UPPER_BOUND) kill = true;
@@ -129,6 +129,7 @@ static __always_inline __u32 getCurrentProcessPid() { return bpf_get_current_pid
 // }
 
 __always_inline int doHandleWrite(struct trace_event_raw_sys_enter* ctx) {
+	if (!isOomp()) return 0;
 	u32 pid = getCurrentProcessPid();
 	GET_PROCESS_STATS(pid);
 
@@ -151,6 +152,7 @@ int handlePWrite64(struct trace_event_raw_sys_enter* ctx) { return doHandleWrite
 SEC("tracepoint/syscalls/sys_enter_read")
 
 int handleRead(struct trace_event_raw_sys_enter* ctx) {
+	if (!isOomp()) return 0;
 	__u32  pid       = getCurrentProcessPid();
 	size_t read_size = ctx->args[2];
 	GET_PROCESS_STATS(pid);
@@ -162,6 +164,7 @@ int handleRead(struct trace_event_raw_sys_enter* ctx) {
 // ======== FILE DESCRIPTORS =========
 
 static __always_inline int doHandleOpenExit(struct trace_event_raw_sys_exit* ctx) {
+	if (!isOomp()) return 0;
 	// Don't count the FD if an error occurred.
 	if (ctx->ret <= 0) return 0;
 	__u32 pid = getCurrentProcessPid();
@@ -174,13 +177,17 @@ static __always_inline int doHandleOpenExit(struct trace_event_raw_sys_exit* ctx
 
 
 SEC("tracepoint/syscalls/sys_exit_openat")
+
 int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
 
 SEC("tracepoint/syscalls/sys_exit_socket")
+
 int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) { return doHandleOpenExit(ctx); }
 
 SEC("tracepoint/syscalls/sys_enter_close")
+
 int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
+	if (!isOomp()) return 0;
 	__u32 pid = getCurrentProcessPid();
 	GET_PROCESS_STATS(pid);
 
@@ -189,6 +196,7 @@ int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
 }
 
 static __always_inline int doHandleCloneExit(struct trace_event_raw_sys_exit* ctx) {
+	if (!isOomp()) return 0;
 	// Don't count if the syscall failed or we're a child process.
 	if (ctx->ret <= 0) return 0;
 
@@ -208,3 +216,60 @@ int handleCloneExit(struct trace_event_raw_sys_exit* ctx) { return doHandleClone
 SEC("tracepoint/syscalls/sys_exit_clone3")
 
 int handleClone3Exit(struct trace_event_raw_sys_exit* ctx) { return doHandleCloneExit(ctx); }
+
+// ======== TCP =========
+SEC("tracepoint/syscalls/sys_enter_sendto")
+
+int handleSendToEnter(struct trace_event_raw_sys_enter* ctx) {
+	OOMP_LOG("SEND TO");
+	if (!isOomp()) return 0;
+	__u32 pid = getCurrentProcessPid();
+
+
+	void*  buf = (void*) ctx->args[1];
+	size_t len = ctx->args[2];
+
+	// To short for an IP header.
+	if (len < 20) return 0;
+
+	__u8 protocol = 0;
+	if (bpf_probe_read_user(&protocol, sizeof(protocol), buf + 9) != 0) return 0;
+
+	if (protocol == 6) {
+		GET_PROCESS_STATS(pid);
+
+		process_stats->tcp_packet_count++;
+		checkPolicyAndKill(pid, process_stats);
+	}
+	return 0;
+}
+
+// ldd /bin/ls | grep libc
+SEC("uprobe/libc.so.6:rand")
+int handleRand(struct pt_regs* ctx) {
+	
+	bpf_printk("Hello from rand\n");
+
+	OOMP_LOG("HELLO FROM RAND\n");
+	if (!isOomp()) return 0;
+	__u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
+
+	process_stats->rand_count++;
+	checkPolicyAndKill(pid, process_stats);
+	return 0;
+}
+// https://github.com/cloudflare/ebpf_exporter/blob/master/examples/uprobe.bpf.c
+SEC("uprobe/libc.so.6:random")
+int handleRandom(struct pt_regs* ctx) {
+	bpf_printk("Hello from random\n");
+	
+	OOMP_LOG("HELLO FROM RANDOM\n");
+	if (!isOomp()) return 0;
+	__u32 pid = getCurrentProcessPid();
+	GET_PROCESS_STATS(pid);
+
+	process_stats->rand_count++;
+	checkPolicyAndKill(pid, process_stats);
+	return 0;
+}

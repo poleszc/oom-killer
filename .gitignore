@@ -3,7 +3,7 @@
 *.skel.h
 vmlinux.h
 .clang_format
-omm_killer
+oom_killer
 
 oomp_test_fds
 oomp_test_packets
