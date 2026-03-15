@@ -76,7 +76,7 @@ KeepEmptyLinesAtTheStartOfBlocks: false
 MaxEmptyLinesToKeep: 2
 PackConstructorInitializers: CurrentLine
 ReflowComments:  true
-SeparateDefinitionBlocks: Always
+SeparateDefinitionBlocks: Leave
 
 
 # Braces
