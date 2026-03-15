@@ -20,6 +20,10 @@ int main() {
 	for (;;) {
 		struct sysinfo sys_info;
 		sysinfo(&sys_info);
+		printf(
+			"Userspace says RAM used: %lu\n",
+			(sys_info.totalram - sys_info.freeram) * sys_info.mem_unit
+		);
 
 		sleep(1);
 	}

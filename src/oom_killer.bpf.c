@@ -44,8 +44,12 @@ struct {
 	__type(value, ProcessInfo);
 } process_map SEC(".maps");
 
-// RAM used by the process.
-static __u64 ram_used = 0;
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} ram_used_map SEC(".maps");
 
 // ======================= HELPERS =======================
 #define OOMP_LOG(fmt, ...)                                   \
@@ -86,7 +90,11 @@ static __always_inline ProcessInfo* getOrCreateProcessStats(u32 pid) {
 }
 
 static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
-	// if (ram_used < (1024ULL * 1024 * 1024)) return;
+	u32  key      = 0;
+	u64* ram_used = bpf_map_lookup_elem(&ram_used_map, &key);
+	if (!ram_used) return;
+
+	if (*ram_used < RAM_THRESHOLD) return;
 	if (!isOompProcess()) return;
 
 	bool kill = false;
@@ -128,16 +136,46 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	}
 
 // ======================= MEMORY =======================
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);
+	__type(value, u64);
+} info_ptr_map SEC(".maps");
+
+
+SEC("kprobe/si_meminfo")
+int BPF_KPROBE(si_meminfo_enter, struct sysinfo* info) {
+	u32 tid  = bpf_get_current_pid_tgid();
+	u64 addr = (u64) info;
+	bpf_map_update_elem(&info_ptr_map, &tid, &addr, BPF_ANY);
+	return 0;
+}
+
 SEC("kretprobe/si_meminfo")
-int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
-	OOMP_LOG("ram used: %d\n", ram_used);
-	u64 total_ram, free_ram, mem_unit;
+int BPF_KRETPROBE(si_meminfo_exit) {
+	u32  tid      = bpf_get_current_pid_tgid();
+	u64* addr_ptr = bpf_map_lookup_elem(&info_ptr_map, &tid);
+	if (!addr_ptr) return 0;
 
-	bpf_probe_read_kernel(&total_ram, sizeof(total_ram), &info->totalram);
-	bpf_probe_read_kernel(&free_ram, sizeof(free_ram), &info->freeram);
-	bpf_probe_read_kernel(&mem_unit, sizeof(mem_unit), &info->mem_unit);
+	struct sysinfo* info = (struct sysinfo*) *addr_ptr;
 
-	ram_used = (total_ram - free_ram) * mem_unit;
+	u64 total_ram = 0, free_ram = 0, mem_unit = 0;
+	total_ram = BPF_CORE_READ(info, totalram);
+	free_ram  = BPF_CORE_READ(info, freeram);
+	mem_unit  = BPF_CORE_READ(info, mem_unit);
+
+	u64 ram_used = (total_ram - free_ram) * mem_unit;
+
+	u32 key = 0;
+	bpf_map_update_elem(&ram_used_map, &key, &ram_used, BPF_ANY);
+
+	bpf_printk(
+		"RAM: T:%llu F:%llu U:%u | Total Used: %llu", total_ram, free_ram, mem_unit, ram_used
+	);
+
+	bpf_map_delete_elem(&info_ptr_map, &tid);
+
 	return 0;
 }
 
