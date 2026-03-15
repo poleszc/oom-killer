@@ -129,39 +129,47 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 }
 
 // ======================= WRITES =======================
-SEC("tracepoint/syscalls/sys_enter_write")
-int handleWrite(struct trace_event_raw_sys_enter* ctx) {
-	UPDATE_STATS(write_count, 1);
+SEC("tracepoint/syscalls/sys_exit_write")
+int handleWriteExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0) UPDATE_STATS(write_count, 1);
 	return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_pwrite64")
-int handlePWrite64(struct trace_event_raw_sys_enter* ctx) {
-	UPDATE_STATS(write_count, 1);
+SEC("tracepoint/syscalls/sys_exit_pwrite64")
+int handlePWrite64Exit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0) UPDATE_STATS(write_count, 1);
 	return 0;
 }
 
 // ======================= READS =======================
-// TODO: readV?
-// TODO: Trace the exit?
-SEC("tracepoint/syscalls/sys_enter_read")
-int handleRead(struct trace_event_raw_sys_enter* ctx) {
-	UPDATE_STATS(read_bytes, ctx->args[2]);
+SEC("tracepoint/syscalls/sys_exit_read")
+int handleReadExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_readv")
+int handleReadVExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_preadv")
+int handlePReadVExit(struct trace_event_raw_sys_exit* ctx) {
+	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
 	return 0;
 }
 
 // ======================= FILE DESCRIPTORS =======================
 SEC("tracepoint/syscalls/sys_exit_openat")
 int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0)  // TODOP: Comment
-		UPDATE_STATS(open_fds, 1);
+	if (ctx->ret > 0) UPDATE_STATS(open_fds, 1);
 	return 0;
 }
 
 SEC("tracepoint/syscalls/sys_exit_socket")
 int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0)  // TODOP: Comment
-		UPDATE_STATS(open_fds, 1);
+	if (ctx->ret > 0) UPDATE_STATS(open_fds, 1);
 	return 0;
 }
 
@@ -170,6 +178,7 @@ int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
 	if (!isOompProcess()) return 0;
 	u32          pid           = getCurrentProcessPid();
 	ProcessInfo* process_stats = getOrCreateProcessStats(pid);
+	if (!process_stats) return 0;
 
 	if (process_stats->open_fds > 0) __sync_fetch_and_sub(&process_stats->open_fds, 1);
 	return 0;
@@ -205,12 +214,6 @@ int handleSendToEnter(struct trace_event_raw_sys_enter* ctx) {
 // ldd /bin/ls | grep libc
 SEC("uprobe/libc.so.6:rand")
 int handleRand(struct pt_regs* ctx) {
-	UPDATE_STATS(rand_count, 1);
-	return 0;
-}
-
-SEC("uprobe/libc.so.6:random")
-int handleRandom(struct pt_regs* ctx) {
 	UPDATE_STATS(rand_count, 1);
 	return 0;
 }
