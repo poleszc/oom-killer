@@ -94,6 +94,8 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	u64* ram_used = bpf_map_lookup_elem(&ram_used_map, &key);
 	if (!ram_used) return;
 
+	bpf_printk("RAM USED: %llu", *ram_used);
+
 	if (*ram_used < RAM_THRESHOLD) return;
 	if (!isOompProcess()) return;
 
@@ -170,9 +172,9 @@ int BPF_KRETPROBE(si_meminfo_exit) {
 	u32 key = 0;
 	bpf_map_update_elem(&ram_used_map, &key, &ram_used, BPF_ANY);
 
-	bpf_printk(
-		"RAM: T:%llu F:%llu U:%u | Total Used: %llu", total_ram, free_ram, mem_unit, ram_used
-	);
+	// bpf_printk(
+	// 	"RAM: T:%llu F:%llu U:%u | Total Used: %llu", total_ram, free_ram, mem_unit, ram_used
+	// );
 
 	bpf_map_delete_elem(&info_ptr_map, &tid);
 
