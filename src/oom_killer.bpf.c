@@ -12,7 +12,8 @@ char LICENSE[] SEC("license") = "GPL";
 #define THREAD_COUNT_UPPER_BOUND     100
 #define RAND_COUNT_UPPER_BOUND       100
 #define TCP_PACKET_COUNT_UPPER_BOUND 1000
-#define READ_UPPER_BOUND             (1024ULL * 1024 * 10)
+#define READ_UPPER_BOUND             (1024ULL * 1024 * 10)    // 10 MB
+#define RAM_THRESHOLD                (1024ULL * 1024 * 1024)  // 1 GB
 
 // ======================= GLOBAL =======================
 /**
@@ -100,30 +101,37 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	return;
 }
 
-#define UPDATE_STATS(FIELD, AMOUNT)                        \
-	do {                                                   \
-		if (!isOompProcess()) return 0;                    \
-		u32          pid   = getCurrentProcessPid();       \
-		ProcessInfo* stats = getOrCreateProcessStats(pid); \
-		if (!stats) return 0;                              \
-		__sync_fetch_and_add(&stats->FIELD, AMOUNT);       \
-		checkPolicyAndKill(pid, stats);                    \
+/**
+ * @brief Helper macro for updating process statistics @p FIELD by a given @p AMOUNT.
+ * Performs additional bound checks if @p AMOUNT is negative, so the count can't get negative.
+ * @note `if (!stats)` does not need to be here, but the verifier gest confused otherwise.
+ */
+#define UPDATE_STATS(FIELD, AMOUNT)                                                     \
+	do {                                                                                \
+		if (!isOompProcess()) return 0;                                                 \
+		u32          pid   = getCurrentProcessPid();                                    \
+		ProcessInfo* stats = getOrCreateProcessStats(pid);                              \
+		if (!stats) return 0;                                                           \
+		if (AMOUNT < 0) {                                                               \
+			if (stats->FIELD > 0) { __sync_fetch_and_sub(&stats->FIELD, -1 * AMOUNT); } \
+		} else {                                                                        \
+			__sync_fetch_and_add(&stats->FIELD, AMOUNT);                                \
+		}                                                                               \
+		checkPolicyAndKill(pid, stats);                                                 \
 	} while (0)
 
-#define DEFINE_TRACEPOINT_EXIT_HANDLER(TRACEPOINT_NAME, FIELD_NAME, AMOUNT) \
-	SEC("tracepoint/syscalls/" #TRACEPOINT_NAME)                            \
-	int handle_##TRACEPOINT_NAME(struct trace_event_raw_sys_exit* ctx) {        \
-		if (ctx->ret > 0) UPDATE_STATS(FIELD_NAME, AMOUNT);                 \
-		return 0;                                                           \
+#define DEFINE_TRACEPOINT_EXIT_HANDLER(TRACEPOINT_NAME, FIELD_NAME, AMOUNT, RET_VAL_CMP) \
+	SEC("tracepoint/syscalls/" #TRACEPOINT_NAME)                                         \
+	int handle_##TRACEPOINT_NAME(struct trace_event_raw_sys_exit* ctx) {                 \
+		if (ctx->ret RET_VAL_CMP 0) UPDATE_STATS(FIELD_NAME, AMOUNT);                    \
+		return 0;                                                                        \
 	}
 
 // ======================= MEMORY =======================
 SEC("kretprobe/si_meminfo")
 int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 	OOMP_LOG("ram used: %d\n", ram_used);
-	u64 total_ram;
-	u64 free_ram;
-	u64 mem_unit;
+	u64 total_ram, free_ram, mem_unit;
 
 	bpf_probe_read_kernel(&total_ram, sizeof(total_ram), &info->totalram);
 	bpf_probe_read_kernel(&free_ram, sizeof(free_ram), &info->freeram);
@@ -134,34 +142,42 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 }
 
 // ======================= WRITES =======================
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_write, write_count, 1);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwrite64, write_count, 1);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_write, write_count, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwrite64, write_count, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_writev, write_count, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwritev, write_count, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwritev2, write_count, 1, >);
 
 // ======================= READS =======================
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_read, read_bytes, ctx->ret);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_readv, read_bytes, ctx->ret);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_preadv, read_bytes, ctx->ret);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_read, read_bytes, ctx->ret, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_readv, read_bytes, ctx->ret, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pread64, read_bytes, ctx->ret, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_preadv, read_bytes, ctx->ret, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_preadv2, read_bytes, ctx->ret, >);
 
 // ======================= THREADS =======================
-// Don't count if the syscall failed or we're a child process.
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone, thread_count, 1);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone3, thread_count, 1);
+// Don't count if the syscall failed or we're a child process -> ctx->ret > 0
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone, thread_count, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone3, thread_count, 1, >);
 
 // ======================= FILE DESCRIPTORS =======================
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_openat, open_fds, 1);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_socket, open_fds, 1);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_open, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_openat, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_creat, open_fds, 1, >);
 
-SEC("tracepoint/syscalls/sys_enter_close")
-int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
-	if (!isOompProcess()) return 0;
-	u32          pid           = getCurrentProcessPid();
-	ProcessInfo* process_stats = getOrCreateProcessStats(pid);
-	if (!process_stats) return 0;
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_socket, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_accept, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_accept4, open_fds, 1, >);
 
-	if (process_stats->open_fds > 0) __sync_fetch_and_sub(&process_stats->open_fds, 1);
-	return 0;
-}
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup2, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup3, open_fds, 1, >);
 
+// Pipe creates two fds. Returns 0 on success.
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pipe, open_fds, 2, ==);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pipe2, open_fds, 2, ==);
+
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_close, open_fds, -1, ==);
 
 // ======================= TCP =======================
 SEC("tracepoint/syscalls/sys_enter_sendto")
