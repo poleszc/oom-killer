@@ -7,12 +7,6 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define OOMP_LOG(fmt, ...)                                   \
-	do {                                                     \
-		if (isOompProcess()) bpf_printk(fmt, ##__VA_ARGS__); \
-	} while (0)
-
-
 #define WRITE_COUNT_UPPER_BOUND      100
 #define FD_COUNT_UPPER_BOUND         100
 #define THREAD_COUNT_UPPER_BOUND     100
@@ -20,7 +14,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define TCP_PACKET_COUNT_UPPER_BOUND 1000
 #define READ_UPPER_BOUND             (1024ULL * 1024 * 10)
 
-// ======== GLOBAL =========
+// ======================= GLOBAL =======================
 /**
  * @brief The overall state for one process.
  */
@@ -51,6 +45,12 @@ struct {
 
 // RAM used by the process.
 static __u64 ram_used = 0;
+
+// ======================= HELPERS =======================
+#define OOMP_LOG(fmt, ...)                                   \
+	do {                                                     \
+		if (isOompProcess()) bpf_printk(fmt, ##__VA_ARGS__); \
+	} while (0)
 
 /**
  * @brief Whether a process has a `oomp` substring in its name.
@@ -84,8 +84,7 @@ static __always_inline ProcessInfo* getOrCreateProcessStats(u32 pid) {
 	return stats;
 }
 
-// ======== HELPERS =========
-__always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
+static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	// if (ram_used < (1024ULL * 1024 * 1024)) return;
 	if (!isOompProcess()) return;
 
@@ -111,8 +110,14 @@ __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 		checkPolicyAndKill(pid, stats);                    \
 	} while (0)
 
-// ======== MEMORY =========
+#define DEFINE_TRACEPOINT_EXIT_HANDLER(TRACEPOINT_NAME, FIELD_NAME, AMOUNT) \
+	SEC("tracepoint/syscalls/" #TRACEPOINT_NAME)                            \
+	int handle_##TRACEPOINT_NAME(struct trace_event_raw_sys_exit* ctx) {        \
+		if (ctx->ret > 0) UPDATE_STATS(FIELD_NAME, AMOUNT);                 \
+		return 0;                                                           \
+	}
 
+// ======================= MEMORY =======================
 SEC("kretprobe/si_meminfo")
 int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 	OOMP_LOG("ram used: %d\n", ram_used);
@@ -129,49 +134,22 @@ int BPF_KRETPROBE(si_meminfo_exit, struct sysinfo* info) {
 }
 
 // ======================= WRITES =======================
-SEC("tracepoint/syscalls/sys_exit_write")
-int handleWriteExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(write_count, 1);
-	return 0;
-}
-
-SEC("tracepoint/syscalls/sys_exit_pwrite64")
-int handlePWrite64Exit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(write_count, 1);
-	return 0;
-}
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_write, write_count, 1);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwrite64, write_count, 1);
 
 // ======================= READS =======================
-SEC("tracepoint/syscalls/sys_exit_read")
-int handleReadExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
-	return 0;
-}
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_read, read_bytes, ctx->ret);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_readv, read_bytes, ctx->ret);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_preadv, read_bytes, ctx->ret);
 
-SEC("tracepoint/syscalls/sys_exit_readv")
-int handleReadVExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
-	return 0;
-}
-
-SEC("tracepoint/syscalls/sys_exit_preadv")
-int handlePReadVExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(read_bytes, ctx->ret);
-	return 0;
-}
+// ======================= THREADS =======================
+// Don't count if the syscall failed or we're a child process.
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone, thread_count, 1);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone3, thread_count, 1);
 
 // ======================= FILE DESCRIPTORS =======================
-SEC("tracepoint/syscalls/sys_exit_openat")
-int handleOpenFDExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(open_fds, 1);
-	return 0;
-}
-
-SEC("tracepoint/syscalls/sys_exit_socket")
-int handleOpenSocketExit(struct trace_event_raw_sys_exit* ctx) {
-	if (ctx->ret > 0) UPDATE_STATS(open_fds, 1);
-	return 0;
-}
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_openat, open_fds, 1);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_socket, open_fds, 1);
 
 SEC("tracepoint/syscalls/sys_enter_close")
 int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
@@ -184,20 +162,6 @@ int handleCloseEnter(struct trace_event_raw_sys_enter* ctx) {
 	return 0;
 }
 
-// ======================= THREADS =======================
-SEC("tracepoint/syscalls/sys_exit_clone")
-int handleCloneExit(struct trace_event_raw_sys_exit* ctx) {
-	// Don't count if the syscall failed or we're a child process.
-	if (ctx->ret > 0) UPDATE_STATS(thread_count, 1);
-	return 0;
-}
-
-SEC("tracepoint/syscalls/sys_exit_clone3")
-int handleClone3Exit(struct trace_event_raw_sys_exit* ctx) {
-	// Don't count if the syscall failed or we're a child process.
-	if (ctx->ret > 0) UPDATE_STATS(thread_count, 1);
-	return 0;
-}
 
 // ======================= TCP =======================
 SEC("tracepoint/syscalls/sys_enter_sendto")
