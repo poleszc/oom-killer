@@ -133,6 +133,11 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 		checkPolicyAndKill(pid, stats);                                                 \
 	} while (0)
 
+/**
+ * @brief Helper macro to register for the @p TRACEPOINT_NAME exit tracepoint, update the
+ * appropriate @p FIELD_NAME in the process statistics map by a given @p AMOUNT only if the return
+ * value compares to 0 with the given @p RET_VAL_CMP.
+ */
 #define DEFINE_TRACEPOINT_EXIT_HANDLER(TRACEPOINT_NAME, FIELD_NAME, AMOUNT, RET_VAL_CMP) \
 	SEC("tracepoint/syscalls/" #TRACEPOINT_NAME)                                         \
 	int handle_##TRACEPOINT_NAME(struct trace_event_raw_sys_exit* ctx) {                 \
