@@ -18,7 +18,10 @@ VMLINUX_H = $(SRC_DIR)/vmlinux.h
 
 .PHONY: all clean run
 
-all: $(TARGET)
+all: install $(TARGET)
+
+install:
+	sudo apt install clang libbpf-dev bpftool
 
 clean:
 	rm -f $(TARGET)
