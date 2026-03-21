@@ -16,7 +16,6 @@ int main() {
 		goto cleanup;
 	}
 
-	printf("OMM Killer running\n");
 	for (;;) {
 		struct sysinfo sys_info;
 		sysinfo(&sys_info);
@@ -27,9 +26,6 @@ int main() {
 
 		sleep(1);
 	}
-
-
-	pause();
 
 cleanup:
 	oom_killer__destroy(skel);

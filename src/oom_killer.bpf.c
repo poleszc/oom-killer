@@ -14,6 +14,8 @@ char LICENSE[] SEC("license") = "GPL";
 #define TCP_PACKET_COUNT_UPPER_BOUND 1000
 #define READ_UPPER_BOUND             (1024ULL * 1024 * 10)    // 10 MB
 #define RAM_THRESHOLD                (1024ULL * 1024 * 1024)  // 1 GB
+#define TCP_PROTOCOL_TYPE            6
+#define PROTOCOL_TYPE_OFFSET         9
 
 // ======================= GLOBAL =======================
 /**
@@ -44,6 +46,9 @@ struct {
 	__type(value, ProcessInfo);
 } process_map SEC(".maps");
 
+/**
+ * @brief One element map storing the current ram usage.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -94,8 +99,6 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	u64* ram_used = bpf_map_lookup_elem(&ram_used_map, &key);
 	if (!ram_used) return;
 
-	bpf_printk("RAM USED: %llu", *ram_used);
-
 	if (*ram_used < RAM_THRESHOLD) return;
 	if (!isOompProcess()) return;
 
@@ -138,28 +141,37 @@ static __always_inline void checkPolicyAndKill(u32 pid, ProcessInfo* stats) {
 	}
 
 // ======================= MEMORY =======================
+
+/**
+ * @brief A map storing pointer to `sysinfo` structures.
+ * The problem is, that we have access to the `sysinfo` struct at entry, but it's filled with data
+ * during execution. When exiting `meminfo` we only have access to the return code, thus we save the
+ * passed pointer to `sysinfo` and then read it's contents on exit.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
 	__type(key, u32);
 	__type(value, u64);
-} info_ptr_map SEC(".maps");
+} sysinfo_ptr_map SEC(".maps");
 
 
 SEC("kprobe/si_meminfo")
 int BPF_KPROBE(si_meminfo_enter, struct sysinfo* info) {
 	u32 tid  = bpf_get_current_pid_tgid();
 	u64 addr = (u64) info;
-	bpf_map_update_elem(&info_ptr_map, &tid, &addr, BPF_ANY);
+	// Save the argument pointer.
+	bpf_map_update_elem(&sysinfo_ptr_map, &tid, &addr, BPF_ANY);
 	return 0;
 }
 
 SEC("kretprobe/si_meminfo")
 int BPF_KRETPROBE(si_meminfo_exit) {
 	u32  tid      = bpf_get_current_pid_tgid();
-	u64* addr_ptr = bpf_map_lookup_elem(&info_ptr_map, &tid);
+	u64* addr_ptr = bpf_map_lookup_elem(&sysinfo_ptr_map, &tid);
 	if (!addr_ptr) return 0;
 
+	// Now that `sysinfo` is filled with data after `meminfo` executed, we retrieve it.
 	struct sysinfo* info = (struct sysinfo*) *addr_ptr;
 
 	u64 total_ram = 0, free_ram = 0, mem_unit = 0;
@@ -169,18 +181,16 @@ int BPF_KRETPROBE(si_meminfo_exit) {
 
 	u64 ram_used = (total_ram - free_ram) * mem_unit;
 
+	// Update the global ram usage.
 	u32 key = 0;
 	bpf_map_update_elem(&ram_used_map, &key, &ram_used, BPF_ANY);
 
-	// bpf_printk(
-	// 	"RAM: T:%llu F:%llu U:%u | Total Used: %llu", total_ram, free_ram, mem_unit, ram_used
-	// );
-
-	bpf_map_delete_elem(&info_ptr_map, &tid);
+	bpf_map_delete_elem(&sysinfo_ptr_map, &tid);
 
 	return 0;
 }
 
+// Some of those are not needed to pass the tests, but I added them for the killer to be more solid.
 // ======================= WRITES =======================
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_write, write_count, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pwrite64, write_count, 1, >);
@@ -201,18 +211,16 @@ DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone, thread_count, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_clone3, thread_count, 1, >);
 
 // ======================= FILE DESCRIPTORS =======================
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_open, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_openat, open_fds, 1, >);
-DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_creat, open_fds, 1, >);
 
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_open, open_fds, 1, >);
+DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_creat, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_socket, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_accept, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_accept4, open_fds, 1, >);
-
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup2, open_fds, 1, >);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_dup3, open_fds, 1, >);
-
 // Pipe creates two fds. Returns 0 on success.
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pipe, open_fds, 2, ==);
 DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_pipe2, open_fds, 2, ==);
@@ -222,9 +230,12 @@ DEFINE_TRACEPOINT_EXIT_HANDLER(sys_exit_close, open_fds, -1, ==);
 // ======================= TCP =======================
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int handleSendToEnter(struct trace_event_raw_sys_enter* ctx) {
-	void* buf      = (void*) ctx->args[1];
-	u8    protocol = 0;
-	if (bpf_probe_read_user(&protocol, sizeof(protocol), buf + 9) == 0 && protocol == 6)
+	void* buf = (void*) ctx->args[1];
+	// Read the protocol type from the header.
+	// https://en.wikipedia.org/wiki/IPv4#Header
+	u8 protocol = 0;
+	if (bpf_probe_read_user(&protocol, sizeof(protocol), buf + PROTOCOL_TYPE_OFFSET) == 0
+	    && protocol == TCP_PROTOCOL_TYPE)
 		UPDATE_STATS(tcp_packet_count, 1);
 	return 0;
 }
